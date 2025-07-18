@@ -209,19 +209,57 @@ jobs:
             cat fetch_cmd
             echo fetch_cmd_${{ matrix.system }}=$(base64 -w0 fetch_cmd) >> "$GITHUB_OUTPUT"
           fi
+
           dir=~/.cache/nixpkgs-review/pr-${PR_NUMBER}
-          if [[ "$OS" != "Linux" ]]; then
+          report_json="$dir/report.json"
+          report_md="$dir/report.md"
+
+          if [[ "$OS" != "Linux" && -f "$report_md" ]]; then
             sandbox=$(nix config show sandbox)
-            sed -i '/^###/s/$/ (sandbox = '"$sandbox"')/' "$dir/report.md"
+            sed -i '/^###/s/$/ (sandbox = '"$sandbox"')/' "$report_md" || true
           fi
-          if ! [[ -s "$dir/report.md" ]]; then
-            echo -e "\n---" >> "$dir/report.md"
-            echo "### \`${{ matrix.system }}\`" >> "$dir/report.md"
-            echo ":white_check_mark: *No rebuilds*" >> "$dir/report.md"
+
+          has_meta_packages=$(jq 'has("meta") and (.meta | has("packages"))' "$report_json")
+          if [[ "$has_meta_packages" == "true" ]]; then
+            allowed_attrs=$(jq -c '.meta.packages' "$report_json")
+
+            filtered=$(jq --argjson allowed "$allowed_attrs" '
+              [ .result[] | select(.attr as $a | $allowed | index($a)) ]
+            ' "$report_json")
+
+            if [[ "$(jq 'length' <<< "$filtered")" == "0" ]]; then
+              echo "Skipping ${{ matrix.system }}: no packages from meta.packages rebuilt."
+              exit 0
+            fi
+
+            # If report.md is missing, synthesize minimal one
+            if [[ ! -s "$report_md" ]]; then
+              echo -e "\n---" > "$report_md"
+              echo "### \`${{ matrix.system }}\`" >> "$report_md"
+              echo ":white_check_mark: *No rebuilds*" >> "$report_md"
+            fi
+
+            report=$(jq -c --argfile md "$report_md" --argjson result "$filtered" '
+              {
+                meta: .meta,
+                result: $result,
+                md: $md
+              }
+            ' "$report_json" | base64 -w0)
+
+          else
+            # No meta.packages at all → include full report
+            if [[ ! -s "$report_md" ]]; then
+              echo -e "\n---" > "$report_md"
+              echo "### \`${{ matrix.system }}\`" >> "$report_md"
+              echo ":white_check_mark: *No rebuilds*" >> "$report_md"
+            fi
+
+            report=$(jq -c '. + {$md}' "$report_json" --rawfile md "$report_md" | base64 -w0)
           fi
-          cat $dir/report.md
-          report=$(jq -c '.+{$md}' $dir/report.json --rawfile md $dir/report.md | base64 -w0)
-          echo report_${{ matrix.system }}=$report >> "$GITHUB_OUTPUT"
+
+          cat "$report_md"
+          echo "report_${{ matrix.system }}=$report" >> "$GITHUB_OUTPUT"
         env:
           OS: ${{ runner.os }}
 
